@@ -19,8 +19,9 @@ GasSponsor Contract: https://github.com/kinged007/gas-sponsor-contract
    - **Step B1**: Approve PancakeSwap router to spend tokens held by GasSponsor
    - **Step B2**: Execute the swap via PancakeSwap V3 (`exactInputSingle`)
    - **Step C**: Forward output USDT from GasSponsor to user wallet
-6. If a collection wallet is configured, forwards USDT there
+6. If a collection wallet is configured and `collection_timing: after_swap`, forwards USDT there
 7. If the wallet balance drops below the swap amount, marks it DEPLETED
+   - If `collection_timing: on_deplete`, forwards all accumulated USDT to collection wallet just before marking DEPLETED
 8. Exits cleanly — ready for the next cron tick
 
 ### Wallet Lifecycle
@@ -91,6 +92,8 @@ PANCAKE_QUOTER=0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997
 
 # Collection Wallet (optional — receives swapped USDT)
 COLLECTION_WALLET=
+# Timing: "after_swap" (every swap) or "on_deplete" (once, when wallet runs out)
+# Configured in config.yaml under collection_wallet.collection_timing
 
 # Safety
 MAX_SLIPPAGE_BPS=200
@@ -117,6 +120,10 @@ swap:
   slippage_bps: 200          # 2% max slippage
   deadline_seconds: 180      # swap must complete within 3 minutes
   fee_tiers: [100, 500, 2500, 10000]  # PancakeSwap V3 fee tiers to try
+
+collection_wallet:
+  address: "${COLLECTION_WALLET}"
+  collection_timing: after_swap  # "after_swap" = every swap | "on_deplete" = once when wallet runs out
 ```
 
 ### 5. Add wallets

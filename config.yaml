@@ -33,8 +33,13 @@ master_wallet:
   private_key: '${MASTER_PRIVATE_KEY}'
 
 # ── Collection Wallet (where swapped tokens go) ─────
+# collection_timing:
+#   after_swap  — transfer token_out to collection wallet after every swap (default)
+#   on_deplete  — transfer token_out only once, when the wallet is about to be marked DEPLETED
+#                 (saves gas by batching collection into a single transfer per wallet lifecycle)
 collection_wallet:
   address: '${COLLECTION_WALLET}'
+  collection_timing: after_swap
 
 # ── Wallet Spreadsheet ───────────────────────────────
 wallet_spreadsheet:

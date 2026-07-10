@@ -979,6 +979,9 @@ def main():
     master_key = cfg["master_wallet"]["private_key"]
 
     collection_addr = cfg.get("collection_wallet", {}).get("address", "") or ""
+    collection_timing = cfg.get("collection_wallet", {}).get("collection_timing", "after_swap")
+    if collection_timing not in ("after_swap", "on_deplete"):
+        _error_exit(f"Invalid collection_timing '{collection_timing}' — must be 'after_swap' or 'on_deplete'")
 
     sheet_path = cfg["wallet_spreadsheet"]["path"]
     kill_file = cfg["safety"].get("kill_switch_file", "STOP_BOT")
@@ -1298,8 +1301,8 @@ def main():
         })
         _error_exit(f"Swap failed for {amount_human:.0f} {token_in_sym} ({wallet_short})")
 
-    # ── Collection Transfer ──
-    if collection_addr and collection_addr != ZERO_ADDR:
+    # ── Collection Transfer (after_swap mode) ──
+    if collection_timing == "after_swap" and collection_addr and collection_addr != ZERO_ADDR:
         # For collection, user wallet needs to approve GasSponsor for token_out
         # This should already be set if token_out allowance was included in init
         # If not, we need a separate approval — but for simplicity, we handle it
@@ -1328,6 +1331,28 @@ def main():
         time.sleep(2)
         remaining = get_token_balance(w3, token_in_addr, wallet["address"])
         if remaining < amount_to_sell_wei:
+            # ── Collection Transfer (on_deplete mode) ──
+            if collection_timing == "on_deplete" and collection_addr and collection_addr != ZERO_ADDR:
+                out_allowance = get_token_allowance(
+                    w3, token_out_addr, wallet["address"], gas_sponsor_addr
+                )
+                out_balance = get_token_balance(w3, token_out_addr, wallet["address"])
+
+                if out_balance > 0 and out_allowance < out_balance:
+                    print(f"  Output token allowance to GasSponsor insufficient")
+                    print(f"  Skipping collection transfer (needs separate allowance init)")
+                elif out_balance > 0:
+                    execute_collection_transfer(
+                        w3=w3,
+                        master_key=master_key,
+                        master_addr=master_addr,
+                        wallet_addr=wallet["address"],
+                        token_out_addr=token_out_addr,
+                        collection_addr=collection_addr,
+                        gas_sponsor_addr=gas_sponsor_addr,
+                        receipt_timeout=receipt_timeout,
+                    )
+
             wm.mark_depleted(sheet_path, wallet["address"])
             print(f"\n  Wallet marked DEPLETED")
 
