@@ -7,3 +7,4 @@ __pycache__/
 wallets.csv
 .venv/
 venv/
+swap_log.jsonl
