@@ -1,0 +1,9 @@
+secrets/
+.env
+STOP_BOT
+__pycache__/
+*.pyc
+*.log
+wallets.csv
+.venv/
+venv/

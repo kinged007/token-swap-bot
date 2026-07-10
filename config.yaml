@@ -1,0 +1,54 @@
+# ── Network ──────────────────────────────────────────
+network:
+  chain_id: 56
+  rpc_url: '${BSC_RPC_URL}'
+
+# ── Deployed Contracts ───────────────────────────────
+contracts:
+  gas_sponsor:
+    address: '${GAS_SPONSOR_CONTRACT}'
+  pancake_router:
+    address: '${PANCAKE_ROUTER}'
+  pancake_quoter:
+    address: '${PANCAKE_QUOTER}'
+  token_in:
+    address: ''
+    symbol: 
+    decimals: 18
+  token_out:
+    address: '0x55d398326f99059ff775485246999027b3197955'
+    symbol: USDT
+    decimals: 18
+
+# ── Swap Parameters ──────────────────────────────────
+swap:
+  amount_per_run: 3000
+  slippage_bps: 200
+  deadline_seconds: 180
+  fee_tiers: [100, 500, 2500, 10000]
+
+# ── Master Wallet ────────────────────────────────────
+master_wallet:
+  address: '${MASTER_WALLET_ADDRESS}'
+  private_key: '${MASTER_PRIVATE_KEY}'
+
+# ── Collection Wallet (where swapped tokens go) ─────
+collection_wallet:
+  address: '${COLLECTION_WALLET}'
+
+# ── Wallet Spreadsheet ───────────────────────────────
+wallet_spreadsheet:
+  path: wallets.csv
+
+# ── Safety ───────────────────────────────────────────
+safety:
+  kill_switch_file: STOP_BOT
+  max_orders_per_run: 1
+  daily_gas_limit_bnb: 0.5
+  max_retries: 3
+  receipt_timeout: 120
+
+# ── Logging ──────────────────────────────────────────
+logging:
+  log_file: swap_log.jsonl
+  gas_tracker_file: gas_tracker.json
