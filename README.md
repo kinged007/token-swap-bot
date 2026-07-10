@@ -104,7 +104,7 @@ Edit `config.yaml`:
 ```yaml
 contracts:
   token_in:
-    address: "0x94a1a356d4e67a3803bdfaa85c8cba5bc57fd988"
+    address: "0xTokenContractAddressToSwapFrom"
     symbol: "SNACK"
     decimals: 18
   token_out:
@@ -167,7 +167,7 @@ python3 swap.py --dry-run
 ### Target a specific wallet
 
 ```bash
-python3 swap.py --wallet 0xf8ad21fcaba184c1859d4d49a19b1d917a7b421d
+python3 swap.py --wallet 0xAnotherWallet
 ```
 
 ### Collect USDT to collection wallet (no swap)
