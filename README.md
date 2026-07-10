@@ -11,7 +11,7 @@ GasSponsor Contract: https://github.com/kinged007/gas-sponsor-contract
 2. **Auto-whitelists** the target wallet on the GasSponsor contract (if needed)
 3. Runs a **Gas-Refund Loop** (one-time per wallet):
    - Sends a small amount of BNB from master to target wallet
-   - Target wallet approves GasSponsor for unlimited token spending
+   - Target wallet approves GasSponsor for unlimited **token_in** AND **token_out** spending
    - Sweeps residual BNB back to master
 4. Gets a **PancakeSwap V3** quote for the swap (tries fee tiers: 100, 500, 2500, 10000)
 5. Executes a **sponsored swap** via GasSponsor (all gas paid by the contract):
@@ -20,14 +20,16 @@ GasSponsor Contract: https://github.com/kinged007/gas-sponsor-contract
    - **Step B2**: Execute the swap via PancakeSwap V3 (`exactInputSingle`)
    - **Step C**: Forward output USDT from GasSponsor to user wallet
 6. If a collection wallet is configured and `collection_timing: after_swap`, forwards USDT there
-7. If the wallet balance drops below the swap amount, marks it DEPLETED
+7. If the wallet has 0 token_in, attempts collection of any remaining token_out, then marks it DEPLETED
+8. If the wallet balance drops below the swap amount, marks it DEPLETED
    - If `collection_timing: on_deplete`, forwards all accumulated USDT to collection wallet just before marking DEPLETED
-8. Exits cleanly — ready for the next cron tick
+9. Exits cleanly — ready for the next cron tick
 
 ### Wallet Lifecycle
 
 - Wallets with any status **except** `DEPLETED` are eligible
-- First run triggers the **Gas-Refund Loop** (approve + sweep), status set to `INITIALIZED`
+- First run triggers the **Gas-Refund Loop** (approve token_in + token_out, sweep BNB), status set to `INITIALIZED`
+- Legacy wallets missing token_out approval are **auto-approved** on first collection attempt (funds wallet, approves, then collects)
 - If a wallet has **fewer tokens** than `amount_per_run`, it sells what's left
 - After selling, if the wallet is emptied → status set to `DEPLETED`
 - DEPLETED wallets are **never touched again** (kept in CSV for records)
