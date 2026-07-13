@@ -115,17 +115,20 @@ def main():
         except Exception:
             bal_out_human = -1
 
-        # Allowance to GasSponsor
+        # Allowance to GasSponsor (N/A in direct mode)
         try:
-            allowance = c_in.functions.allowance(
-                addr_cs, Web3.to_checksum_address(gas_sponsor_addr)
-            ).call()
-            if allowance > MAX_UINT256 // 2:
-                allow_str = "MAX"
-            elif allowance > 0:
-                allow_str = f"{allowance / (10 ** in_dec):.0f}"
+            if gas_sponsor_addr:
+                allowance = c_in.functions.allowance(
+                    addr_cs, Web3.to_checksum_address(gas_sponsor_addr)
+                ).call()
+                if allowance > MAX_UINT256 // 2:
+                    allow_str = "MAX"
+                elif allowance > 0:
+                    allow_str = f"{allowance / (10 ** in_dec):.0f}"
+                else:
+                    allow_str = "0"
             else:
-                allow_str = "0"
+                allow_str = "N/A"
         except Exception:
             allow_str = "N/A"
 

@@ -1,11 +1,17 @@
 # Token Swap Bot
 
-Gasless Token → USDT swaps on BNB Smart Chain via a custom **GasSponsor** smart contract and **PancakeSwap V3**.
+Token → USDT swaps on BNB Smart Chain via **PancakeSwap V3**.
+Supports two execution modes:
+- **Sponsored mode** (default): Gasless swaps via a custom **GasSponsor** smart contract — wallets never need BNB.
+- **Direct mode**: Wallets pay their own gas — activated when `GAS_SPONSOR_CONTRACT` is not set in `.env`.
+
 Designed for multi-wallet, cron-driven execution — one swap per run, then exits.
 
 GasSponsor Contract: https://github.com/kinged007/gas-sponsor-contract
 
 ## How It Works
+
+### Sponsored Mode (GAS_SPONSOR_CONTRACT is set)
 
 1. Reads wallet addresses from `wallets.csv`, picks the first non-DEPLETED wallet
 2. **Auto-whitelists** the target wallet on the GasSponsor contract (if needed)
@@ -25,8 +31,23 @@ GasSponsor Contract: https://github.com/kinged007/gas-sponsor-contract
    - If `collection_timing: on_deplete`, forwards all accumulated USDT to collection wallet just before marking DEPLETED
 9. Exits cleanly — ready for the next cron tick
 
+### Direct Mode (GAS_SPONSOR_CONTRACT is empty or not set)
+
+1. Reads wallet addresses from `wallets.csv`, picks the first non-DEPLETED wallet
+2. **Funds the wallet** with BNB from master (configurable `direct_swap_bnb`, default 0.002 BNB)
+   - Only sends BNB if wallet balance is too low to cover swap gas
+   - Checked on every run — tops up if needed
+3. Skips GasSponsor authorization entirely (no contract to approve)
+4. Gets a **PancakeSwap V3** quote for the swap
+5. Wallet **approves the PancakeSwap router** directly (if allowance insufficient)
+6. Wallet **calls `exactInputSingle` directly** — output tokens land in the wallet itself
+7. If a collection wallet is configured, wallet **transfers token_out directly** to collection address
+8. When wallet is depleted, **sweeps remaining BNB** to collection address (or master if no collection wallet)
+9. Marks wallet DEPLETED and exits
+
 ### Wallet Lifecycle
 
+**Sponsored mode:**
 - Wallets with any status **except** `DEPLETED` are eligible
 - First run triggers the **Gas-Refund Loop** (approve token_in + token_out, sweep BNB), status set to `INITIALIZED`
 - Legacy wallets missing token_out approval are **auto-approved** on first collection attempt (funds wallet, approves, then collects)
@@ -34,6 +55,12 @@ GasSponsor Contract: https://github.com/kinged007/gas-sponsor-contract
 - After selling, if the wallet is emptied → status set to `DEPLETED`
 - DEPLETED wallets are **never touched again** (kept in CSV for records)
 - Whitelisted wallets remain whitelisted permanently for future transactions
+
+**Direct mode:**
+- First run sends BNB from master to wallet (if needed)
+- Wallet pays its own gas for all transactions (approve, swap, collect)
+- On deplete, remaining BNB is swept to collection address (or master)
+- Otherwise identical: sells what's left, marks DEPLETED when empty
 
 ## Project Structure
 
@@ -57,8 +84,9 @@ token-swap-bot/
 ### 1. Prerequisites
 
 - Python 3.11+
-- A funded **master wallet** (contract owner) with BNB for gas
-- The **GasSponsor** smart contract deployed on BSC mainnet
+- A funded **master wallet** with BNB for gas
+- **Sponsored mode**: The **GasSponsor** smart contract deployed on BSC mainnet
+- **Direct mode**: No contract needed — just a master wallet with BNB to fund target wallets
 
 ### 2. Install
 
@@ -83,12 +111,12 @@ Required variables in `.env`:
 # Network
 BSC_RPC_URL=https://bsc-dataseed.binance.org
 
-# Master Wallet (contract owner, pays for all gas orchestration)
+# Master Wallet (pays for all gas orchestration)
 MASTER_WALLET_ADDRESS=0xYourMasterAddress
 MASTER_PRIVATE_KEY=0xYourMasterPrivateKey
 
 # Deployed Contracts
-GAS_SPONSOR_CONTRACT=0xYourGasSponsorContractAddress
+GAS_SPONSOR_CONTRACT=0xYourGasSponsorContractAddress   # Leave empty for Direct Mode
 PANCAKE_ROUTER=0x1b81D678ffb9C0263b24A97847620C99d213eB14
 PANCAKE_QUOTER=0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997
 
@@ -101,6 +129,8 @@ COLLECTION_WALLET=
 MAX_SLIPPAGE_BPS=200
 DAILY_GAS_LIMIT_BNB=0.5
 ```
+
+> **Mode selection**: The bot automatically runs in **Sponsored mode** when `GAS_SPONSOR_CONTRACT` is set, or **Direct mode** when it is empty or omitted.
 
 ### 4. Configure swap parameters
 
@@ -122,6 +152,7 @@ swap:
   slippage_bps: 200          # 2% max slippage
   deadline_seconds: 180      # swap must complete within 3 minutes
   fee_tiers: [100, 500, 2500, 10000]  # PancakeSwap V3 fee tiers to try
+  direct_swap_bnb: 0.002     # BNB sent to wallet for gas in Direct Mode
 
 collection_wallet:
   address: "${COLLECTION_WALLET}"
@@ -154,7 +185,7 @@ Address,Private Key,Secret Phrase,Status
 python3 check_balances.py
 ```
 
-Shows BNB balance, TOKEN balance, USDT balance, and GasSponsor allowance for each wallet.
+Shows BNB balance, TOKEN balance, USDT balance, and GasSponsor allowance for each wallet (allowance shows "N/A" in Direct mode).
 
 ## Usage
 
@@ -197,11 +228,18 @@ crontab -e
 0 * * * * cd /home/user/Sync/token-swap-bot && source .venv/bin/activate && python3 swap.py --quiet >> logs/cron.log 2>&1
 ```
 
-Quiet mode output example:
+Quiet mode output example (Sponsored):
 ```
 ✅ Swap: 100 TOKEN → 0.101365 USDT (0x1694...f056)
 👛 Wallet: 4216.65 TOKEN | 0.101365 USDT
 💰 Master: 0.0088 BNB | Sponsor: 0.0062 BNB
+```
+
+Quiet mode output example (Direct):
+```
+✅ Swap: 100 TOKEN → 0.101365 USDT (0x1694...f056)
+👛 Wallet: 4216.65 TOKEN | 0.101365 USDT
+💰 Master: 0.0088 BNB | Wallet BNB: 0.001540
 ```
 
 On error:
@@ -299,7 +337,20 @@ The script checks for `STOP_BOT` on every run and exits immediately if found.
 
 ## Architecture
 
-### GasSponsor Contract
+### Execution Modes
+
+The bot detects its mode at startup based on `GAS_SPONSOR_CONTRACT`:
+
+| | Sponsored Mode | Direct Mode |
+|---|---|---|
+| **Trigger** | `GAS_SPONSOR_CONTRACT` is set | `GAS_SPONSOR_CONTRACT` is empty/omitted |
+| **Who pays gas** | GasSponsor contract | Target wallet (funded by master) |
+| **Wallet init** | Gas-Refund Loop (approve + sweep) | BNB top-up from master |
+| **Swap caller** | Master → GasSponsor.execute() | Wallet → Router.exactInputSingle() |
+| **Collection** | Via GasSponsor (pull + forward) | Wallet → collection wallet (direct transfer) |
+| **On deplete** | Mark DEPLETED | Sweep BNB + mark DEPLETED |
+
+### GasSponsor Contract (Sponsored Mode only)
 
 The GasSponsor contract (`0xF36Aa6f2...`) is a generic executor with whitelist protection:
 

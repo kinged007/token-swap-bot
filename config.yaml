@@ -27,6 +27,9 @@ swap:
   slippage_bps: 200
   deadline_seconds: 180
   fee_tiers: [100, 500, 2500, 10000]
+  # BNB to send wallet for gas when running in direct mode (no GasSponsor).
+  # Adjust manually based on network gas prices.
+  direct_swap_bnb: 0.002
 
 # ── Master Wallet ────────────────────────────────────
 master_wallet:

@@ -821,6 +821,308 @@ def _transfer_from_sponsor_to_user(w3, master_key, master_addr, gas_sponsor_addr
 
 
 # ══════════════════════════════════════════════════════════════════
+# Direct Mode: BNB Funding, Swap, Collection, Sweep
+# ══════════════════════════════════════════════════════════════════
+
+def ensure_wallet_bnb(
+    w3: Web3,
+    master_key: str,
+    master_addr: str,
+    wallet_addr: str,
+    direct_swap_bnb_wei: int,
+    max_retries: int = 3,
+    receipt_timeout: int = 120,
+) -> bool:
+    """Ensure wallet has BNB for direct-mode swaps.
+
+    If wallet BNB is below the estimated cost for one swap, send
+    direct_swap_bnb_wei from master to wallet.
+    Returns True on success (or if already funded).
+    """
+    gas_price = w3.eth.gas_price
+    # Estimate: approve (~60k) + swap (~300k) + transfer (~60k) with 20% buffer
+    estimated_gas = int((60000 + 300000 + 60000) * gas_price * 1.2)
+    wallet_bnb = w3.eth.get_balance(Web3.to_checksum_address(wallet_addr))
+    print(f"  Wallet BNB balance: {w3.from_wei(wallet_bnb, 'ether')} BNB")
+
+    if wallet_bnb >= estimated_gas:
+        print(f"  Wallet has sufficient BNB — skipping top-up")
+        return True
+
+    # Need funding — send from master
+    print(f"  Wallet needs BNB — sending {w3.from_wei(direct_swap_bnb_wei, 'ether')} BNB from master...")
+    master_balance = w3.eth.get_balance(Web3.to_checksum_address(master_addr))
+    if master_balance < direct_swap_bnb_wei:
+        print(f"  ERROR: Master wallet has insufficient BNB ({w3.from_wei(master_balance, 'ether')})")
+        return False
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            nonce = w3.eth.get_transaction_count(
+                Web3.to_checksum_address(master_addr), "pending"
+            )
+            fund_tx = {
+                "from": Web3.to_checksum_address(master_addr),
+                "to": Web3.to_checksum_address(wallet_addr),
+                "value": direct_swap_bnb_wei,
+                "gas": 21000,
+                "gasPrice": gas_price,
+                "nonce": nonce,
+                "chainId": w3.eth.chain_id,
+            }
+            receipt = sign_and_send(w3, master_key, fund_tx, "Fund wallet (direct)", receipt_timeout)
+            gas_bnb = float(w3.from_wei(
+                receipt["gasUsed"] * receipt.get("effectiveGasPrice", gas_price), "ether"
+            ))
+            record_gas_spent("gas_tracker.json", gas_bnb)
+            return True
+        except Exception as e:
+            print(f"    Attempt {attempt}/{max_retries} failed: {e}")
+            if attempt == max_retries:
+                print("  ERROR: Failed to fund wallet after max retries")
+                return False
+            time.sleep(2 ** attempt)
+            gas_price = w3.eth.gas_price
+
+    return False
+
+
+def execute_direct_swap(
+    w3: Web3,
+    wallet_key: str,
+    wallet_addr: str,
+    token_in_addr: str,
+    token_out_addr: str,
+    amount_in_wei: int,
+    min_amount_out: int,
+    router_addr: str,
+    fee_tier: int,
+    deadline_seconds: int = 180,
+    max_retries: int = 3,
+    receipt_timeout: int = 120,
+) -> bool:
+    """Execute a direct swap: wallet approves router and calls exactInputSingle.
+
+    Wallet pays its own gas. Returns True on success.
+    """
+    print("\n  === Direct Swap ===")
+    token_in_c = w3.eth.contract(
+        address=Web3.to_checksum_address(token_in_addr), abi=ERC20_ABI
+    )
+    router_c = w3.eth.contract(
+        address=Web3.to_checksum_address(router_addr), abi=ROUTER_ABI
+    )
+
+    gas_price = w3.eth.gas_price
+    deadline = int(time.time()) + deadline_seconds
+    wallet_cs = Web3.to_checksum_address(wallet_addr)
+    router_cs = Web3.to_checksum_address(router_addr)
+
+    # ── Step 1: Ensure router allowance for token_in ──
+    allowance = get_token_allowance(w3, token_in_addr, wallet_addr, router_addr)
+    if allowance < amount_in_wei:
+        print(f"  Approving router for token_in...")
+        for attempt in range(1, max_retries + 1):
+            try:
+                nonce = w3.eth.get_transaction_count(wallet_cs, "pending")
+                approve_tx = token_in_c.functions.approve(
+                    router_cs, MAX_UINT256
+                ).build_transaction({
+                    "from": wallet_cs,
+                    "gas": 70000,
+                    "gasPrice": gas_price,
+                    "nonce": nonce,
+                    "chainId": w3.eth.chain_id,
+                })
+                receipt = sign_and_send(w3, wallet_key, approve_tx, "Approve router", receipt_timeout)
+                gas_bnb = float(w3.from_wei(
+                    receipt["gasUsed"] * receipt.get("effectiveGasPrice", gas_price), "ether"
+                ))
+                record_gas_spent("gas_tracker.json", gas_bnb)
+                break
+            except Exception as e:
+                print(f"    Attempt {attempt}/{max_retries} failed: {e}")
+                if attempt == max_retries:
+                    print("  ERROR: Router approve failed")
+                    return False
+                time.sleep(2 ** attempt)
+                gas_price = w3.eth.gas_price
+
+    # ── Step 2: Execute swap ──
+    print(f"  Executing swap via PancakeSwap V3...")
+    swap_params = (
+        Web3.to_checksum_address(token_in_addr),
+        Web3.to_checksum_address(token_out_addr),
+        fee_tier,
+        wallet_cs,  # recipient = wallet itself
+        deadline,
+        amount_in_wei,
+        min_amount_out,
+        0,  # sqrtPriceLimitX96
+    )
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            nonce = w3.eth.get_transaction_count(wallet_cs, "pending")
+            swap_tx = router_c.functions.exactInputSingle(swap_params).build_transaction({
+                "from": wallet_cs,
+                "gasPrice": gas_price,
+                "nonce": nonce,
+                "chainId": w3.eth.chain_id,
+            })
+            try:
+                est = w3.eth.estimate_gas(swap_tx)
+                swap_tx["gas"] = int(est * 1.3)
+            except Exception:
+                swap_tx["gas"] = 500000
+
+            receipt = sign_and_send(w3, wallet_key, swap_tx, "Direct swap", receipt_timeout)
+            gas_bnb = float(w3.from_wei(
+                receipt["gasUsed"] * receipt.get("effectiveGasPrice", gas_price), "ether"
+            ))
+            record_gas_spent("gas_tracker.json", gas_bnb)
+
+            # Check output
+            output_balance = get_token_balance(w3, token_out_addr, wallet_addr)
+            print(f"  Swap complete! Output tokens in wallet: {output_balance}")
+            return True
+        except Exception as e:
+            print(f"    Attempt {attempt}/{max_retries} failed: {e}")
+            if attempt == max_retries:
+                print("  ERROR: Direct swap failed")
+                return False
+            time.sleep(2 ** attempt)
+            gas_price = w3.eth.gas_price
+
+    return False
+
+
+def execute_direct_collection(
+    w3: Web3,
+    wallet_key: str,
+    wallet_addr: str,
+    token_out_addr: str,
+    collection_addr: str,
+    max_retries: int = 3,
+    receipt_timeout: int = 120,
+) -> bool:
+    """Transfer token_out from wallet directly to collection wallet.
+
+    Wallet pays its own gas. Returns True on success.
+    """
+    if not collection_addr or collection_addr == ZERO_ADDR:
+        print("  Collection wallet not configured — skipping transfer")
+        return True
+
+    balance = get_token_balance(w3, token_out_addr, wallet_addr)
+    if balance == 0:
+        print("  No output tokens in wallet to collect")
+        return True
+
+    print(f"\n  === Direct Collection Transfer ===")
+    print(f"  Transferring {balance} output tokens to collection wallet...")
+
+    token_out_c = w3.eth.contract(
+        address=Web3.to_checksum_address(token_out_addr), abi=ERC20_ABI
+    )
+    wallet_cs = Web3.to_checksum_address(wallet_addr)
+    gas_price = w3.eth.gas_price
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            nonce = w3.eth.get_transaction_count(wallet_cs, "pending")
+            transfer_tx = token_out_c.functions.transfer(
+                Web3.to_checksum_address(collection_addr), balance
+            ).build_transaction({
+                "from": wallet_cs,
+                "gas": 70000,
+                "gasPrice": gas_price,
+                "nonce": nonce,
+                "chainId": w3.eth.chain_id,
+            })
+            receipt = sign_and_send(w3, wallet_key, transfer_tx, "Collect tokens", receipt_timeout)
+            gas_bnb = float(w3.from_wei(
+                receipt["gasUsed"] * receipt.get("effectiveGasPrice", gas_price), "ether"
+            ))
+            record_gas_spent("gas_tracker.json", gas_bnb)
+            print(f"  Collected {balance} tokens to {collection_addr}")
+            return True
+        except Exception as e:
+            print(f"    Attempt {attempt}/{max_retries} failed: {e}")
+            if attempt == max_retries:
+                print("  ERROR: Direct collection transfer failed")
+                return False
+            time.sleep(2 ** attempt)
+            gas_price = w3.eth.gas_price
+
+    return False
+
+
+def sweep_bnb_to_collection(
+    w3: Web3,
+    wallet_key: str,
+    wallet_addr: str,
+    collection_addr: str,
+    master_addr: str,
+    max_retries: int = 3,
+    receipt_timeout: int = 120,
+) -> bool:
+    """Sweep all remaining BNB from wallet to collection (or master) address.
+
+    Called when wallet is depleted in direct mode.
+    Returns True on success.
+    """
+    dest = collection_addr if (collection_addr and collection_addr != ZERO_ADDR) else master_addr
+    wallet_cs = Web3.to_checksum_address(wallet_addr)
+    wallet_bnb = w3.eth.get_balance(wallet_cs)
+    gas_price = w3.eth.gas_price
+    sweep_cost = 21000 * gas_price
+    sweep_amount = wallet_bnb - sweep_cost
+
+    if sweep_amount <= 0:
+        print(f"  No BNB to sweep (balance: {w3.from_wei(wallet_bnb, 'ether')})")
+        return True
+
+    print(f"\n  === Sweep BNB ===")
+    print(f"  Sending {w3.from_wei(sweep_amount, 'ether')} BNB to {dest[:10]}...")
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            nonce = w3.eth.get_transaction_count(wallet_cs, "pending")
+            gas_price = w3.eth.gas_price  # refresh
+            sweep_cost = 21000 * gas_price
+            sweep_amount = w3.eth.get_balance(wallet_cs) - sweep_cost
+            if sweep_amount <= 0:
+                print(f"  No BNB to sweep after refresh")
+                return True
+
+            sweep_tx = {
+                "from": wallet_cs,
+                "to": Web3.to_checksum_address(dest),
+                "value": sweep_amount,
+                "gas": 21000,
+                "gasPrice": gas_price,
+                "nonce": nonce,
+                "chainId": w3.eth.chain_id,
+            }
+            receipt = sign_and_send(w3, wallet_key, sweep_tx, "Sweep BNB", receipt_timeout)
+            gas_bnb = float(w3.from_wei(
+                receipt["gasUsed"] * receipt.get("effectiveGasPrice", gas_price), "ether"
+            ))
+            record_gas_spent("gas_tracker.json", gas_bnb)
+            print(f"  Swept {w3.from_wei(sweep_amount, 'ether')} BNB to {dest[:10]}...")
+            return True
+        except Exception as e:
+            print(f"    Attempt {attempt}/{max_retries} failed: {e}")
+            if attempt == max_retries:
+                print("  WARNING: BNB sweep failed — some BNB may be trapped in wallet")
+                return False
+            time.sleep(2 ** attempt)
+
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════
 # Token-Out Approval (for legacy wallets)
 # ══════════════════════════════════════════════════════════════════
 
@@ -1128,6 +1430,7 @@ def main():
     slippage_bps = cfg["swap"].get("slippage_bps", 200)
     deadline_seconds = cfg["swap"].get("deadline_seconds", 180)
     fee_tiers = cfg["swap"].get("fee_tiers", [2500, 500, 10000])
+    direct_swap_bnb = float(cfg["swap"].get("direct_swap_bnb", 0.002))
 
     master_addr = cfg["master_wallet"]["address"]
     master_key = cfg["master_wallet"]["private_key"]
@@ -1148,8 +1451,9 @@ def main():
     # ── Validation ──
     if not master_addr or not master_key:
         _error_exit("MASTER_WALLET_ADDRESS and MASTER_PRIVATE_KEY must be set in .env")
-    if not gas_sponsor_addr:
-        _error_exit("GAS_SPONSOR_CONTRACT must be set in .env")
+
+    # Mode: sponsored (GasSponsor contract) or direct (wallet pays own gas)
+    sponsored_mode = bool(gas_sponsor_addr)
 
     # ── Kill switch ──
     if os.path.exists(kill_file):
@@ -1157,15 +1461,19 @@ def main():
         sys.exit(0)
 
     # ── Print header ──
+    mode_label = "Sponsored (GasSponsor)" if sponsored_mode else "Direct (self-funded)"
     print(f"{'=' * 55}")
-    print(f"  Token Swap Bot — GasSponsor + PancakeSwap V3")
+    print(f"  Token Swap Bot — {mode_label} + PancakeSwap V3")
     print(f"{'=' * 55}")
     print(f"  Chain:    BSC ({chain_id})")
     print(f"  Sell:     {token_in_sym} ({token_in_addr[:10]}...)")
     print(f"  Buy:      {token_out_sym} ({token_out_addr[:10]}...)")
     print(f"  Amount:   {amount_per_run} {token_in_sym} per run")
     print(f"  Slippage: {slippage_bps / 100:.1f}%")
-    print(f"  Sponsor:  {gas_sponsor_addr[:10]}...")
+    if sponsored_mode:
+        print(f"  Sponsor:  {gas_sponsor_addr[:10]}...")
+    else:
+        print(f"  Mode:     Direct (wallet pays gas, {direct_swap_bnb} BNB funding)")
     if collection_addr:
         print(f"  Collect:  {collection_addr[:10]}...")
 
@@ -1180,78 +1488,80 @@ def main():
         sys.exit(1)
 
     # ── Ensure master wallet is whitelisted on GasSponsor ──
-    gas_sponsor_c = w3.eth.contract(
-        address=Web3.to_checksum_address(gas_sponsor_addr), abi=GAS_SPONSOR_ABI
-    )
-    contract_owner = gas_sponsor_c.functions.owner().call()
-    is_master_owner = contract_owner.lower() == master_addr.lower()
-    master_whitelisted = gas_sponsor_c.functions.whitelist(
-        Web3.to_checksum_address(master_addr)
-    ).call()
+    gas_sponsor_c = None
+    if sponsored_mode:
+        gas_sponsor_c = w3.eth.contract(
+            address=Web3.to_checksum_address(gas_sponsor_addr), abi=GAS_SPONSOR_ABI
+        )
+        contract_owner = gas_sponsor_c.functions.owner().call()
+        is_master_owner = contract_owner.lower() == master_addr.lower()
+        master_whitelisted = gas_sponsor_c.functions.whitelist(
+            Web3.to_checksum_address(master_addr)
+        ).call()
 
-    if not master_whitelisted:
-        if is_master_owner:
-            print(f"  Master wallet is contract owner but not whitelisted — auto-whitelisting...")
-            nonce = w3.eth.get_transaction_count(
-                Web3.to_checksum_address(master_addr), "pending"
-            )
-            wl_tx = gas_sponsor_c.functions.updateWhitelist(
-                Web3.to_checksum_address(master_addr), True
-            ).build_transaction({
-                "from": Web3.to_checksum_address(master_addr),
-                "gasPrice": w3.eth.gas_price,
-                "nonce": nonce,
-                "chainId": w3.eth.chain_id,
-            })
-            try:
-                est = w3.eth.estimate_gas(wl_tx)
-                wl_tx["gas"] = int(est * 1.2)
-            except Exception:
-                wl_tx["gas"] = 100000
-            sign_and_send(w3, master_key, wl_tx, "Whitelist master")
-            print(f"  Master wallet whitelisted: YES (auto)")
+        if not master_whitelisted:
+            if is_master_owner:
+                print(f"  Master wallet is contract owner but not whitelisted — auto-whitelisting...")
+                nonce = w3.eth.get_transaction_count(
+                    Web3.to_checksum_address(master_addr), "pending"
+                )
+                wl_tx = gas_sponsor_c.functions.updateWhitelist(
+                    Web3.to_checksum_address(master_addr), True
+                ).build_transaction({
+                    "from": Web3.to_checksum_address(master_addr),
+                    "gasPrice": w3.eth.gas_price,
+                    "nonce": nonce,
+                    "chainId": w3.eth.chain_id,
+                })
+                try:
+                    est = w3.eth.estimate_gas(wl_tx)
+                    wl_tx["gas"] = int(est * 1.2)
+                except Exception:
+                    wl_tx["gas"] = 100000
+                sign_and_send(w3, master_key, wl_tx, "Whitelist master")
+                print(f"  Master wallet whitelisted: YES (auto)")
+            else:
+                print(f"  ERROR: Master wallet {master_addr} is NOT whitelisted and is NOT the owner")
+                print(f"  Call updateWhitelist({master_addr}, true) from the contract owner")
+                sys.exit(1)
         else:
-            print(f"  ERROR: Master wallet {master_addr} is NOT whitelisted and is NOT the owner")
-            print(f"  Call updateWhitelist({master_addr}, true) from the contract owner")
-            sys.exit(1)
-    else:
-        print(f"  Master wallet whitelisted: YES")
+            print(f"  Master wallet whitelisted: YES")
 
-    # ── Ensure GasSponsor contract has BNB for gas pool ──
-    sponsor_bnb = w3.eth.get_balance(Web3.to_checksum_address(gas_sponsor_addr))
-    sponsor_bnb_eth = float(w3.from_wei(sponsor_bnb, "ether"))
-    print(f"  GasSponsor BNB balance: {sponsor_bnb_eth:.6f} BNB")
-    if sponsor_bnb_eth < 0.005:
-        # Adaptive: send what master can spare (keep 0.003 BNB reserve for txs)
-        master_bnb = w3.eth.get_balance(Web3.to_checksum_address(master_addr))
-        reserve = w3.to_wei(0.003, "ether")  # keep for gas-refund loop + tx gas
-        gas_cost_estimate = 50000 * w3.eth.gas_price  # receive() needs >21k gas
-        max_fund = master_bnb - reserve - gas_cost_estimate
-        if max_fund <= 0:
-            print(f"  WARNING: Master BNB too low ({w3.from_wei(master_bnb, 'ether')}) to fund GasSponsor")
-            print(f"  Proceeding with {sponsor_bnb_eth:.6f} BNB in contract")
-        else:
-            fund_amount = min(max_fund, w3.to_wei(0.05, "ether"))  # cap at 0.05 BNB
-            print(f"  GasSponsor needs BNB — funding {w3.from_wei(fund_amount, 'ether')} BNB from master...")
-            nonce = w3.eth.get_transaction_count(
-                Web3.to_checksum_address(master_addr), "pending"
-            )
-            fund_tx = {
-                "from": Web3.to_checksum_address(master_addr),
-                "to": Web3.to_checksum_address(gas_sponsor_addr),
-                "value": fund_amount,
-                "gas": 50000,  # receive() emits event, needs >21000
-                "gasPrice": w3.eth.gas_price,
-                "nonce": nonce,
-                "chainId": w3.eth.chain_id,
-            }
-            receipt = sign_and_send(w3, master_key, fund_tx, "Fund GasSponsor")
-            gas_bnb = float(w3.from_wei(
-                receipt["gasUsed"] * receipt.get("effectiveGasPrice", 0), "ether"
-            ))
-            record_gas_spent(gas_tracker_file, gas_bnb)
-            sponsor_bnb = w3.eth.get_balance(Web3.to_checksum_address(gas_sponsor_addr))
-            print(f"  GasSponsor BNB balance now: {w3.from_wei(sponsor_bnb, 'ether')} BNB")
+        # ── Ensure GasSponsor contract has BNB for gas pool ──
+        sponsor_bnb = w3.eth.get_balance(Web3.to_checksum_address(gas_sponsor_addr))
+        sponsor_bnb_eth = float(w3.from_wei(sponsor_bnb, "ether"))
+        print(f"  GasSponsor BNB balance: {sponsor_bnb_eth:.6f} BNB")
+        if sponsor_bnb_eth < 0.005:
+            # Adaptive: send what master can spare (keep 0.003 BNB reserve for txs)
+            master_bnb = w3.eth.get_balance(Web3.to_checksum_address(master_addr))
+            reserve = w3.to_wei(0.003, "ether")  # keep for gas-refund loop + tx gas
+            gas_cost_estimate = 50000 * w3.eth.gas_price  # receive() needs >21k gas
+            max_fund = master_bnb - reserve - gas_cost_estimate
+            if max_fund <= 0:
+                print(f"  WARNING: Master BNB too low ({w3.from_wei(master_bnb, 'ether')}) to fund GasSponsor")
+                print(f"  Proceeding with {sponsor_bnb_eth:.6f} BNB in contract")
+            else:
+                fund_amount = min(max_fund, w3.to_wei(0.05, "ether"))  # cap at 0.05 BNB
+                print(f"  GasSponsor needs BNB — funding {w3.from_wei(fund_amount, 'ether')} BNB from master...")
+                nonce = w3.eth.get_transaction_count(
+                    Web3.to_checksum_address(master_addr), "pending"
+                )
+                fund_tx = {
+                    "from": Web3.to_checksum_address(master_addr),
+                    "to": Web3.to_checksum_address(gas_sponsor_addr),
+                    "value": fund_amount,
+                    "gas": 50000,  # receive() emits event, needs >21000
+                    "gasPrice": w3.eth.gas_price,
+                    "nonce": nonce,
+                    "chainId": w3.eth.chain_id,
+                }
+                receipt = sign_and_send(w3, master_key, fund_tx, "Fund GasSponsor")
+                gas_bnb = float(w3.from_wei(
+                    receipt["gasUsed"] * receipt.get("effectiveGasPrice", 0), "ether"
+                ))
+                record_gas_spent(gas_tracker_file, gas_bnb)
+                sponsor_bnb = w3.eth.get_balance(Web3.to_checksum_address(gas_sponsor_addr))
+                print(f"  GasSponsor BNB balance now: {w3.from_wei(sponsor_bnb, 'ether')} BNB")
 
     # ── Get wallet from CSV ──
     print(f"\n  Reading wallet spreadsheet: {sheet_path}")
@@ -1271,31 +1581,32 @@ def main():
         print(f"  Status: {wallet['status']}")
 
     # ── Ensure target wallet is whitelisted on GasSponsor ──
-    target_whitelisted = gas_sponsor_c.functions.whitelist(
-        Web3.to_checksum_address(wallet["address"])
-    ).call()
-    if not target_whitelisted:
-        print(f"  Target wallet not whitelisted — whitelisting...")
-        nonce = w3.eth.get_transaction_count(
-            Web3.to_checksum_address(master_addr), "pending"
-        )
-        wl_tx = gas_sponsor_c.functions.updateWhitelist(
-            Web3.to_checksum_address(wallet["address"]), True
-        ).build_transaction({
-            "from": Web3.to_checksum_address(master_addr),
-            "gasPrice": w3.eth.gas_price,
-            "nonce": nonce,
-            "chainId": w3.eth.chain_id,
-        })
-        try:
-            est = w3.eth.estimate_gas(wl_tx)
-            wl_tx["gas"] = int(est * 1.2)
-        except Exception:
-            wl_tx["gas"] = 100000
-        sign_and_send(w3, master_key, wl_tx, "Whitelist target wallet")
-        print(f"  Target wallet whitelisted: YES")
-    else:
-        print(f"  Target wallet whitelisted: YES (already)")
+    if sponsored_mode:
+        target_whitelisted = gas_sponsor_c.functions.whitelist(
+            Web3.to_checksum_address(wallet["address"])
+        ).call()
+        if not target_whitelisted:
+            print(f"  Target wallet not whitelisted — whitelisting...")
+            nonce = w3.eth.get_transaction_count(
+                Web3.to_checksum_address(master_addr), "pending"
+            )
+            wl_tx = gas_sponsor_c.functions.updateWhitelist(
+                Web3.to_checksum_address(wallet["address"]), True
+            ).build_transaction({
+                "from": Web3.to_checksum_address(master_addr),
+                "gasPrice": w3.eth.gas_price,
+                "nonce": nonce,
+                "chainId": w3.eth.chain_id,
+            })
+            try:
+                est = w3.eth.estimate_gas(wl_tx)
+                wl_tx["gas"] = int(est * 1.2)
+            except Exception:
+                wl_tx["gas"] = 100000
+            sign_and_send(w3, master_key, wl_tx, "Whitelist target wallet")
+            print(f"  Target wallet whitelisted: YES")
+        else:
+            print(f"  Target wallet whitelisted: YES (already)")
 
     # ── Check token balance ──
     balance_wei = get_token_balance(w3, token_in_addr, wallet["address"])
@@ -1312,36 +1623,53 @@ def main():
         wallet_short = f"{wallet['address'][:6]}...{wallet['address'][-4:]}"
 
         if collection_addr and collection_addr != ZERO_ADDR:
-            out_allowance = get_token_allowance(
-                w3, token_out_addr, wallet["address"], gas_sponsor_addr
-            )
             out_balance = get_token_balance(w3, token_out_addr, wallet["address"])
 
             if out_balance > 0:
-                # Auto-approve token_out if needed (legacy wallets)
-                if out_allowance < out_balance:
-                    approved = ensure_token_out_approval(
-                        w3=w3, master_key=master_key, master_addr=master_addr,
-                        wallet_addr=wallet["address"], wallet_key=wallet["private_key"],
-                        token_out_addr=token_out_addr, gas_sponsor_addr=gas_sponsor_addr,
-                        required_amount=out_balance, max_retries=max_retries,
-                        receipt_timeout=receipt_timeout,
+                if sponsored_mode:
+                    # Sponsored: check/approve GasSponsor for token_out
+                    out_allowance = get_token_allowance(
+                        w3, token_out_addr, wallet["address"], gas_sponsor_addr
                     )
-                    if not approved:
-                        log_event(log_file, "collection_skipped", {
-                            "wallet": wallet["address"], "reason": "auto_approval_failed",
-                            "balance": out_balance,
-                        })
-                        _out(f"⚠️ Collection skipped: token_out auto-approval failed ({wallet_short})")
-                        approved = False
-                else:
-                    approved = True
+                    if out_allowance < out_balance:
+                        approved = ensure_token_out_approval(
+                            w3=w3, master_key=master_key, master_addr=master_addr,
+                            wallet_addr=wallet["address"], wallet_key=wallet["private_key"],
+                            token_out_addr=token_out_addr, gas_sponsor_addr=gas_sponsor_addr,
+                            required_amount=out_balance, max_retries=max_retries,
+                            receipt_timeout=receipt_timeout,
+                        )
+                        if not approved:
+                            log_event(log_file, "collection_skipped", {
+                                "wallet": wallet["address"], "reason": "auto_approval_failed",
+                                "balance": out_balance,
+                            })
+                            _out(f"⚠️ Collection skipped: token_out auto-approval failed ({wallet_short})")
+                            approved = False
+                    else:
+                        approved = True
 
-                if approved:
-                    ok = execute_collection_transfer(
-                        w3=w3, master_key=master_key, master_addr=master_addr,
+                    if approved:
+                        ok = execute_collection_transfer(
+                            w3=w3, master_key=master_key, master_addr=master_addr,
+                            wallet_addr=wallet["address"], token_out_addr=token_out_addr,
+                            collection_addr=collection_addr, gas_sponsor_addr=gas_sponsor_addr,
+                            receipt_timeout=receipt_timeout,
+                        )
+                        log_event(log_file, "collection_success" if ok else "collection_failed", {
+                            "wallet": wallet["address"], "timing": "zero_balance_deplete",
+                            "amount": out_balance, "collection_wallet": collection_addr,
+                        })
+                        if ok:
+                            _out(f"📦 Collected {out_balance} token_out → {collection_addr[:6]}... ({wallet_short})")
+                        else:
+                            _out(f"❌ Collection failed for {wallet_short}")
+                else:
+                    # Direct: wallet transfers token_out directly
+                    ok = execute_direct_collection(
+                        w3=w3, wallet_key=wallet["private_key"],
                         wallet_addr=wallet["address"], token_out_addr=token_out_addr,
-                        collection_addr=collection_addr, gas_sponsor_addr=gas_sponsor_addr,
+                        collection_addr=collection_addr, max_retries=max_retries,
                         receipt_timeout=receipt_timeout,
                     )
                     log_event(log_file, "collection_success" if ok else "collection_failed", {
@@ -1357,6 +1685,15 @@ def main():
                     "wallet": wallet["address"], "reason": "zero_balance",
                 })
 
+        # In direct mode, sweep remaining BNB on deplete
+        if not sponsored_mode:
+            sweep_bnb_to_collection(
+                w3=w3, wallet_key=wallet["private_key"],
+                wallet_addr=wallet["address"], collection_addr=collection_addr,
+                master_addr=master_addr, max_retries=max_retries,
+                receipt_timeout=receipt_timeout,
+            )
+
         wm.mark_depleted(sheet_path, wallet["address"])
         log_event(log_file, "wallet_depleted", {"wallet": wallet["address"]})
         print(f"  Wallet marked DEPLETED")
@@ -1371,9 +1708,15 @@ def main():
     will_be_depleted = balance_wei <= amount_to_sell_wei
 
     # ── Check allowance state ──
-    allowance = get_token_allowance(w3, token_in_addr, wallet["address"], gas_sponsor_addr)
-    needs_init = allowance < amount_to_sell_wei
-    print(f"  Allowance to GasSponsor: {'MAX' if allowance > MAX_UINT256 // 2 else allowance}")
+    if sponsored_mode:
+        allowance = get_token_allowance(w3, token_in_addr, wallet["address"], gas_sponsor_addr)
+        needs_init = allowance < amount_to_sell_wei
+        print(f"  Allowance to GasSponsor: {'MAX' if allowance > MAX_UINT256 // 2 else allowance}")
+    else:
+        # Direct mode: check allowance to router; also ensure wallet has BNB
+        allowance = get_token_allowance(w3, token_in_addr, wallet["address"], router_addr)
+        needs_init = allowance < amount_to_sell_wei
+        print(f"  Allowance to Router: {'MAX' if allowance > MAX_UINT256 // 2 else allowance}")
 
     if needs_init:
         print(f"  Wallet needs initialization (gas-refund loop)")
@@ -1383,9 +1726,15 @@ def main():
         print(f"\n  === DRY RUN ===")
         print(f"  Would perform:")
         if needs_init:
-            print(f"    1. Gas-Refund Loop (approve + sweep)")
+            if sponsored_mode:
+                print(f"    1. Gas-Refund Loop (approve + sweep)")
+            else:
+                print(f"    1. Fund wallet with BNB (if needed)")
         print(f"    2. Get PancakeSwap V3 quote for {amount_human} {token_in_sym}")
-        print(f"    3. Sponsored swap via GasSponsor")
+        if sponsored_mode:
+            print(f"    3. Sponsored swap via GasSponsor")
+        else:
+            print(f"    3. Direct swap via PancakeSwap router")
         if collection_addr:
             print(f"    4. Collection transfer to {collection_addr}")
         print(f"  Exiting dry run.")
@@ -1402,74 +1751,110 @@ def main():
             sys.exit(0)
         out_human = out_balance / (10 ** token_out_dec)
         print(f"\n  Collect-only: {out_human:.6f} {token_out_sym} to {collection_addr}")
-        out_allowance = get_token_allowance(
-            w3, token_out_addr, wallet["address"], gas_sponsor_addr
-        )
-        if out_allowance < out_balance:
-            approved = ensure_token_out_approval(
-                w3=w3, master_key=master_key, master_addr=master_addr,
-                wallet_addr=wallet["address"], wallet_key=wallet["private_key"],
-                token_out_addr=token_out_addr, gas_sponsor_addr=gas_sponsor_addr,
-                required_amount=out_balance, max_retries=max_retries,
+        if sponsored_mode:
+            out_allowance = get_token_allowance(
+                w3, token_out_addr, wallet["address"], gas_sponsor_addr
+            )
+            if out_allowance < out_balance:
+                approved = ensure_token_out_approval(
+                    w3=w3, master_key=master_key, master_addr=master_addr,
+                    wallet_addr=wallet["address"], wallet_key=wallet["private_key"],
+                    token_out_addr=token_out_addr, gas_sponsor_addr=gas_sponsor_addr,
+                    required_amount=out_balance, max_retries=max_retries,
+                    receipt_timeout=receipt_timeout,
+                )
+                if not approved:
+                    print(f"  ERROR: token_out auto-approval failed")
+                    sys.exit(1)
+            success = execute_collection_transfer(
+                w3=w3,
+                master_key=master_key,
+                master_addr=master_addr,
+                wallet_addr=wallet["address"],
+                token_out_addr=token_out_addr,
+                collection_addr=collection_addr,
+                gas_sponsor_addr=gas_sponsor_addr,
                 receipt_timeout=receipt_timeout,
             )
-            if not approved:
-                print(f"  ERROR: token_out auto-approval failed")
-                sys.exit(1)
-        success = execute_collection_transfer(
-            w3=w3,
-            master_key=master_key,
-            master_addr=master_addr,
-            wallet_addr=wallet["address"],
-            token_out_addr=token_out_addr,
-            collection_addr=collection_addr,
-            gas_sponsor_addr=gas_sponsor_addr,
-            receipt_timeout=receipt_timeout,
-        )
+        else:
+            success = execute_direct_collection(
+                w3=w3, wallet_key=wallet["private_key"],
+                wallet_addr=wallet["address"], token_out_addr=token_out_addr,
+                collection_addr=collection_addr, max_retries=max_retries,
+                receipt_timeout=receipt_timeout,
+            )
         if success:
             master_bnb_final = w3.eth.get_balance(Web3.to_checksum_address(master_addr))
-            sponsor_bnb_final = w3.eth.get_balance(Web3.to_checksum_address(gas_sponsor_addr))
             master_bnb_eth = float(w3.from_wei(master_bnb_final, "ether"))
-            sponsor_bnb_eth = float(w3.from_wei(sponsor_bnb_final, "ether"))
-            log_event(log_file, "collection_success", {
+            log_data = {
                 "wallet": wallet["address"],
                 "amount": out_human,
                 "token": token_out_sym,
                 "collection_wallet": collection_addr,
                 "master_bnb": round(master_bnb_eth, 6),
-                "sponsor_bnb": round(sponsor_bnb_eth, 6),
-            })
+            }
+            if sponsored_mode:
+                sponsor_bnb_final = w3.eth.get_balance(Web3.to_checksum_address(gas_sponsor_addr))
+                sponsor_bnb_eth = float(w3.from_wei(sponsor_bnb_final, "ether"))
+                log_data["sponsor_bnb"] = round(sponsor_bnb_eth, 6)
+            log_event(log_file, "collection_success", log_data)
             wallet_short = f"{wallet['address'][:6]}...{wallet['address'][-4:]}"
             _out(f"✅ Collected: {out_human:.6f} {token_out_sym} → {collection_addr[:10]}... ({wallet_short})")
-            _out(f"💰 Master: {master_bnb_eth:.4f} BNB | Sponsor: {sponsor_bnb_eth:.4f} BNB")
+            if sponsored_mode:
+                _out(f"💰 Master: {master_bnb_eth:.4f} BNB | Sponsor: {sponsor_bnb_eth:.4f} BNB")
+            else:
+                _out(f"💰 Master: {master_bnb_eth:.4f} BNB")
         else:
             wallet_short = f"{wallet['address'][:6]}...{wallet['address'][-4:]}"
             _error_exit(f"Collection failed for {wallet_short}")
         sys.exit(0)
 
-    # ── Gas-Refund Loop (if needed) ──
+    # ── Init / Funding (if needed) ──
     if needs_init:
-        success = execute_gas_refund_loop(
-            w3=w3,
-            master_key=master_key,
-            master_addr=master_addr,
-            wallet_addr=wallet["address"],
-            wallet_key=wallet["private_key"],
-            token_in_addr=token_in_addr,
-            token_out_addr=token_out_addr,
-            gas_sponsor_addr=gas_sponsor_addr,
-            max_retries=max_retries,
-            receipt_timeout=receipt_timeout,
-        )
-        if not success:
-            wallet_short = f"{wallet['address'][:6]}...{wallet['address'][-4:]}"
-            log_event(log_file, "gas_refund_loop_failed", {
-                "wallet": wallet["address"],
-            })
-            _error_exit(f"Gas-Refund Loop failed for {wallet_short}")
+        if sponsored_mode:
+            success = execute_gas_refund_loop(
+                w3=w3,
+                master_key=master_key,
+                master_addr=master_addr,
+                wallet_addr=wallet["address"],
+                wallet_key=wallet["private_key"],
+                token_in_addr=token_in_addr,
+                token_out_addr=token_out_addr,
+                gas_sponsor_addr=gas_sponsor_addr,
+                max_retries=max_retries,
+                receipt_timeout=receipt_timeout,
+            )
+            if not success:
+                wallet_short = f"{wallet['address'][:6]}...{wallet['address'][-4:]}"
+                log_event(log_file, "gas_refund_loop_failed", {
+                    "wallet": wallet["address"],
+                })
+                _error_exit(f"Gas-Refund Loop failed for {wallet_short}")
+            # Update wallet status
+            wm.update_status(sheet_path, wallet["address"], "INITIALIZED")
+        else:
+            # Direct mode: just ensure wallet has BNB for gas
+            direct_swap_bnb_wei = w3.to_wei(direct_swap_bnb, "ether")
+            success = ensure_wallet_bnb(
+                w3=w3, master_key=master_key, master_addr=master_addr,
+                wallet_addr=wallet["address"], direct_swap_bnb_wei=direct_swap_bnb_wei,
+                max_retries=max_retries, receipt_timeout=receipt_timeout,
+            )
+            if not success:
+                wallet_short = f"{wallet['address'][:6]}...{wallet['address'][-4:]}"
+                log_event(log_file, "wallet_funding_failed", {
+                    "wallet": wallet["address"],
+                })
+                _error_exit(f"Wallet funding failed for {wallet_short}")
 
-        # Update wallet status
-        wm.update_status(sheet_path, wallet["address"], "INITIALIZED")
+    # ── In direct mode, always ensure wallet has BNB before swap ──
+    if not sponsored_mode and not needs_init:
+        direct_swap_bnb_wei = w3.to_wei(direct_swap_bnb, "ether")
+        ensure_wallet_bnb(
+            w3=w3, master_key=master_key, master_addr=master_addr,
+            wallet_addr=wallet["address"], direct_swap_bnb_wei=direct_swap_bnb_wei,
+            max_retries=max_retries, receipt_timeout=receipt_timeout,
+        )
 
     # ── Get quote from PancakeSwap V3 ──
     print(f"\n  Getting PancakeSwap V3 quote...")
@@ -1491,23 +1876,39 @@ def main():
     min_human = min_amount_out / (10 ** token_out_dec)
     print(f"  Min output ({slippage_bps / 100:.1f}% slippage): {min_human:.6f} {token_out_sym}")
 
-    # ── Execute Sponsored Swap ──
-    swap_success = execute_sponsored_swap(
-        w3=w3,
-        master_key=master_key,
-        master_addr=master_addr,
-        wallet_addr=wallet["address"],
-        token_in_addr=token_in_addr,
-        token_out_addr=token_out_addr,
-        amount_in_wei=amount_to_sell_wei,
-        min_amount_out=min_amount_out,
-        gas_sponsor_addr=gas_sponsor_addr,
-        router_addr=router_addr,
-        fee_tier=fee_tier,
-        deadline_seconds=deadline_seconds,
-        max_retries=max_retries,
-        receipt_timeout=receipt_timeout,
-    )
+    # ── Execute Swap ──
+    if sponsored_mode:
+        swap_success = execute_sponsored_swap(
+            w3=w3,
+            master_key=master_key,
+            master_addr=master_addr,
+            wallet_addr=wallet["address"],
+            token_in_addr=token_in_addr,
+            token_out_addr=token_out_addr,
+            amount_in_wei=amount_to_sell_wei,
+            min_amount_out=min_amount_out,
+            gas_sponsor_addr=gas_sponsor_addr,
+            router_addr=router_addr,
+            fee_tier=fee_tier,
+            deadline_seconds=deadline_seconds,
+            max_retries=max_retries,
+            receipt_timeout=receipt_timeout,
+        )
+    else:
+        swap_success = execute_direct_swap(
+            w3=w3,
+            wallet_key=wallet["private_key"],
+            wallet_addr=wallet["address"],
+            token_in_addr=token_in_addr,
+            token_out_addr=token_out_addr,
+            amount_in_wei=amount_to_sell_wei,
+            min_amount_out=min_amount_out,
+            router_addr=router_addr,
+            fee_tier=fee_tier,
+            deadline_seconds=deadline_seconds,
+            max_retries=max_retries,
+            receipt_timeout=receipt_timeout,
+        )
 
     if not swap_success:
         wallet_short = f"{wallet['address'][:6]}...{wallet['address'][-4:]}"
@@ -1523,35 +1924,52 @@ def main():
 
     # ── Collection Transfer (after_swap mode) ──
     if collection_timing == "after_swap" and collection_addr and collection_addr != ZERO_ADDR:
-        out_allowance = get_token_allowance(
-            w3, token_out_addr, wallet["address"], gas_sponsor_addr
-        )
         out_balance = get_token_balance(w3, token_out_addr, wallet["address"])
 
         if out_balance > 0:
-            # Auto-approve token_out if needed (legacy wallets)
-            if out_allowance < out_balance:
-                approved = ensure_token_out_approval(
-                    w3=w3, master_key=master_key, master_addr=master_addr,
-                    wallet_addr=wallet["address"], wallet_key=wallet["private_key"],
-                    token_out_addr=token_out_addr, gas_sponsor_addr=gas_sponsor_addr,
-                    required_amount=out_balance, max_retries=max_retries,
-                    receipt_timeout=receipt_timeout,
+            if sponsored_mode:
+                out_allowance = get_token_allowance(
+                    w3, token_out_addr, wallet["address"], gas_sponsor_addr
                 )
-                if not approved:
-                    log_event(log_file, "collection_skipped", {
-                        "wallet": wallet["address"], "reason": "auto_approval_failed",
-                        "balance": out_balance,
-                    })
-                    _out(f"⚠️ Collection skipped: token_out auto-approval failed ({wallet_short})")
-            else:
-                approved = True
+                # Auto-approve token_out if needed (legacy wallets)
+                if out_allowance < out_balance:
+                    approved = ensure_token_out_approval(
+                        w3=w3, master_key=master_key, master_addr=master_addr,
+                        wallet_addr=wallet["address"], wallet_key=wallet["private_key"],
+                        token_out_addr=token_out_addr, gas_sponsor_addr=gas_sponsor_addr,
+                        required_amount=out_balance, max_retries=max_retries,
+                        receipt_timeout=receipt_timeout,
+                    )
+                    if not approved:
+                        log_event(log_file, "collection_skipped", {
+                            "wallet": wallet["address"], "reason": "auto_approval_failed",
+                            "balance": out_balance,
+                        })
+                        _out(f"⚠️ Collection skipped: token_out auto-approval failed ({wallet_short})")
+                else:
+                    approved = True
 
-            if approved:
-                ok = execute_collection_transfer(
-                    w3=w3, master_key=master_key, master_addr=master_addr,
+                if approved:
+                    ok = execute_collection_transfer(
+                        w3=w3, master_key=master_key, master_addr=master_addr,
+                        wallet_addr=wallet["address"], token_out_addr=token_out_addr,
+                        collection_addr=collection_addr, gas_sponsor_addr=gas_sponsor_addr,
+                        receipt_timeout=receipt_timeout,
+                    )
+                    log_event(log_file, "collection_success" if ok else "collection_failed", {
+                        "wallet": wallet["address"], "timing": "after_swap",
+                        "amount": out_balance, "collection_wallet": collection_addr,
+                    })
+                    if ok:
+                        _out(f"📦 Collected {out_balance} token_out → {collection_addr[:6]}... ({wallet_short})")
+                    else:
+                        _out(f"❌ Collection failed for {wallet_short}")
+            else:
+                # Direct mode: wallet transfers directly
+                ok = execute_direct_collection(
+                    w3=w3, wallet_key=wallet["private_key"],
                     wallet_addr=wallet["address"], token_out_addr=token_out_addr,
-                    collection_addr=collection_addr, gas_sponsor_addr=gas_sponsor_addr,
+                    collection_addr=collection_addr, max_retries=max_retries,
                     receipt_timeout=receipt_timeout,
                 )
                 log_event(log_file, "collection_success" if ok else "collection_failed", {
@@ -1570,35 +1988,52 @@ def main():
         if remaining < amount_to_sell_wei:
             # ── Collection Transfer (on_deplete mode) ──
             if collection_timing == "on_deplete" and collection_addr and collection_addr != ZERO_ADDR:
-                out_allowance = get_token_allowance(
-                    w3, token_out_addr, wallet["address"], gas_sponsor_addr
-                )
                 out_balance = get_token_balance(w3, token_out_addr, wallet["address"])
 
                 if out_balance > 0:
-                    # Auto-approve token_out if needed (legacy wallets)
-                    if out_allowance < out_balance:
-                        approved = ensure_token_out_approval(
-                            w3=w3, master_key=master_key, master_addr=master_addr,
-                            wallet_addr=wallet["address"], wallet_key=wallet["private_key"],
-                            token_out_addr=token_out_addr, gas_sponsor_addr=gas_sponsor_addr,
-                            required_amount=out_balance, max_retries=max_retries,
-                            receipt_timeout=receipt_timeout,
+                    if sponsored_mode:
+                        out_allowance = get_token_allowance(
+                            w3, token_out_addr, wallet["address"], gas_sponsor_addr
                         )
-                        if not approved:
-                            log_event(log_file, "collection_skipped", {
-                                "wallet": wallet["address"], "reason": "auto_approval_failed",
-                                "balance": out_balance,
-                            })
-                            _out(f"⚠️ Collection skipped: token_out auto-approval failed ({wallet_short})")
-                    else:
-                        approved = True
+                        # Auto-approve token_out if needed (legacy wallets)
+                        if out_allowance < out_balance:
+                            approved = ensure_token_out_approval(
+                                w3=w3, master_key=master_key, master_addr=master_addr,
+                                wallet_addr=wallet["address"], wallet_key=wallet["private_key"],
+                                token_out_addr=token_out_addr, gas_sponsor_addr=gas_sponsor_addr,
+                                required_amount=out_balance, max_retries=max_retries,
+                                receipt_timeout=receipt_timeout,
+                            )
+                            if not approved:
+                                log_event(log_file, "collection_skipped", {
+                                    "wallet": wallet["address"], "reason": "auto_approval_failed",
+                                    "balance": out_balance,
+                                })
+                                _out(f"⚠️ Collection skipped: token_out auto-approval failed ({wallet_short})")
+                        else:
+                            approved = True
 
-                    if approved:
-                        ok = execute_collection_transfer(
-                            w3=w3, master_key=master_key, master_addr=master_addr,
+                        if approved:
+                            ok = execute_collection_transfer(
+                                w3=w3, master_key=master_key, master_addr=master_addr,
+                                wallet_addr=wallet["address"], token_out_addr=token_out_addr,
+                                collection_addr=collection_addr, gas_sponsor_addr=gas_sponsor_addr,
+                                receipt_timeout=receipt_timeout,
+                            )
+                            log_event(log_file, "collection_success" if ok else "collection_failed", {
+                                "wallet": wallet["address"], "timing": "on_deplete",
+                                "amount": out_balance, "collection_wallet": collection_addr,
+                            })
+                            if ok:
+                                _out(f"📦 Collected {out_balance} token_out → {collection_addr[:6]}... ({wallet_short})")
+                            else:
+                                _out(f"❌ Collection failed for {wallet_short}")
+                    else:
+                        # Direct mode: wallet transfers directly
+                        ok = execute_direct_collection(
+                            w3=w3, wallet_key=wallet["private_key"],
                             wallet_addr=wallet["address"], token_out_addr=token_out_addr,
-                            collection_addr=collection_addr, gas_sponsor_addr=gas_sponsor_addr,
+                            collection_addr=collection_addr, max_retries=max_retries,
                             receipt_timeout=receipt_timeout,
                         )
                         log_event(log_file, "collection_success" if ok else "collection_failed", {
@@ -1614,21 +2049,28 @@ def main():
                         "wallet": wallet["address"], "reason": "zero_balance",
                     })
 
+            # In direct mode, sweep remaining BNB on deplete
+            if not sponsored_mode:
+                sweep_bnb_to_collection(
+                    w3=w3, wallet_key=wallet["private_key"],
+                    wallet_addr=wallet["address"], collection_addr=collection_addr,
+                    master_addr=master_addr, max_retries=max_retries,
+                    receipt_timeout=receipt_timeout,
+                )
+
             wm.mark_depleted(sheet_path, wallet["address"])
             print(f"\n  Wallet marked DEPLETED")
 
     # ── Summary ──
     # Fetch final balances for reporting (cron-friendly)
     master_bnb_final = w3.eth.get_balance(Web3.to_checksum_address(master_addr))
-    sponsor_bnb_final = w3.eth.get_balance(Web3.to_checksum_address(gas_sponsor_addr))
     master_bnb_eth = float(w3.from_wei(master_bnb_final, "ether"))
-    sponsor_bnb_eth = float(w3.from_wei(sponsor_bnb_final, "ether"))
 
     # Wallet token balances after swap
     wallet_token_in = get_token_balance(w3, token_in_addr, wallet["address"]) / (10 ** token_in_dec)
     wallet_token_out = get_token_balance(w3, token_out_addr, wallet["address"]) / (10 ** token_out_dec)
 
-    log_event(log_file, "swap_success", {
+    log_data = {
         "wallet": wallet["address"],
         "amount_in": amount_human,
         "token_in": token_in_sym,
@@ -1638,13 +2080,22 @@ def main():
         "wallet_token_in": round(wallet_token_in, 4),
         "wallet_token_out": round(wallet_token_out, 6),
         "master_bnb": round(master_bnb_eth, 6),
-        "sponsor_bnb": round(sponsor_bnb_eth, 6),
-    })
+    }
+    if sponsored_mode:
+        sponsor_bnb_final = w3.eth.get_balance(Web3.to_checksum_address(gas_sponsor_addr))
+        sponsor_bnb_eth = float(w3.from_wei(sponsor_bnb_final, "ether"))
+        log_data["sponsor_bnb"] = round(sponsor_bnb_eth, 6)
+    log_event(log_file, "swap_success", log_data)
 
     # Output summary (always visible, even in --quiet mode)
     _out(f"✅ Swap: {amount_human:.0f} {token_in_sym} → {expected_human:.6f} {token_out_sym} ({wallet_short})")
     _out(f"👛 Wallet: {wallet_token_in:.2f} {token_in_sym} | {wallet_token_out:.6f} {token_out_sym}")
-    _out(f"💰 Master: {master_bnb_eth:.4f} BNB | Sponsor: {sponsor_bnb_eth:.4f} BNB")
+    if sponsored_mode:
+        _out(f"💰 Master: {master_bnb_eth:.4f} BNB | Sponsor: {sponsor_bnb_eth:.4f} BNB")
+    else:
+        wallet_bnb_final = w3.eth.get_balance(Web3.to_checksum_address(wallet["address"]))
+        wallet_bnb_eth = float(w3.from_wei(wallet_bnb_final, "ether"))
+        _out(f"💰 Master: {master_bnb_eth:.4f} BNB | Wallet BNB: {wallet_bnb_eth:.6f}")
 
 
 if __name__ == "__main__":
