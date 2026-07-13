@@ -22,7 +22,8 @@ contracts:
 
 # ── Swap Parameters ──────────────────────────────────
 swap:
-  amount_per_run: 3000
+  amount_per_run: 4000
+  amount_randomize_pct: 20
   slippage_bps: 200
   deadline_seconds: 180
   fee_tiers: [100, 500, 2500, 10000]
@@ -39,7 +40,7 @@ master_wallet:
 #                 (saves gas by batching collection into a single transfer per wallet lifecycle)
 collection_wallet:
   address: '${COLLECTION_WALLET}'
-  collection_timing: after_swap
+  collection_timing: on_deplete
 
 # ── Wallet Spreadsheet ───────────────────────────────
 wallet_spreadsheet:

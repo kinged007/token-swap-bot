@@ -110,7 +110,7 @@ Edit `config.yaml`:
 contracts:
   token_in:
     address: "0xTokenContractAddressToSwapFrom"
-    symbol: "SNACK"
+    symbol: "TOKEN"
     decimals: 18
   token_out:
     address: "0x55d398326f99059ff775485246999027b3197955"
@@ -154,7 +154,7 @@ Address,Private Key,Secret Phrase,Status
 python3 check_balances.py
 ```
 
-Shows BNB balance, SNACK balance, USDT balance, and GasSponsor allowance for each wallet.
+Shows BNB balance, TOKEN balance, USDT balance, and GasSponsor allowance for each wallet.
 
 ## Usage
 
@@ -199,13 +199,14 @@ crontab -e
 
 Quiet mode output example:
 ```
-✅ Swap: 100 SNACK → 0.101365 USDT (0x1694...f056)
+✅ Swap: 100 TOKEN → 0.101365 USDT (0x1694...f056)
+👛 Wallet: 4216.65 TOKEN | 0.101365 USDT
 💰 Master: 0.0088 BNB | Sponsor: 0.0062 BNB
 ```
 
 On error:
 ```
-❌ Swap failed for 100 SNACK (0x1694...f056)
+❌ Swap failed for 100 TOKEN (0x1694...f056)
 ```
 
 ### Manage wallets

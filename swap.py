@@ -12,7 +12,7 @@ Architecture:
 One wallet, one transaction per run. Respects STOP_BOT kill switch.
 """
 import builtins
-import json, os, re, sys, time
+import json, os, random, re, sys, time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -1120,6 +1120,11 @@ def main():
     quoter_addr = cfg["contracts"]["pancake_quoter"]["address"]
 
     amount_per_run = cfg["swap"]["amount_per_run"]
+    amount_randomize_pct = cfg["swap"].get("amount_randomize_pct", 0)
+    if amount_randomize_pct > 0:
+        pct = random.uniform(-amount_randomize_pct, amount_randomize_pct) / 100.0
+        amount_per_run = amount_per_run * (1 + pct)
+        print(f"  Randomized amount: {amount_per_run:.4f} (base ±{amount_randomize_pct}%)")
     slippage_bps = cfg["swap"].get("slippage_bps", 200)
     deadline_seconds = cfg["swap"].get("deadline_seconds", 180)
     fee_tiers = cfg["swap"].get("fee_tiers", [2500, 500, 10000])
@@ -1619,6 +1624,10 @@ def main():
     master_bnb_eth = float(w3.from_wei(master_bnb_final, "ether"))
     sponsor_bnb_eth = float(w3.from_wei(sponsor_bnb_final, "ether"))
 
+    # Wallet token balances after swap
+    wallet_token_in = get_token_balance(w3, token_in_addr, wallet["address"]) / (10 ** token_in_dec)
+    wallet_token_out = get_token_balance(w3, token_out_addr, wallet["address"]) / (10 ** token_out_dec)
+
     log_event(log_file, "swap_success", {
         "wallet": wallet["address"],
         "amount_in": amount_human,
@@ -1626,12 +1635,15 @@ def main():
         "token_out": token_out_sym,
         "expected_out": expected_human,
         "fee_tier": fee_tier,
+        "wallet_token_in": round(wallet_token_in, 4),
+        "wallet_token_out": round(wallet_token_out, 6),
         "master_bnb": round(master_bnb_eth, 6),
         "sponsor_bnb": round(sponsor_bnb_eth, 6),
     })
 
     # Output summary (always visible, even in --quiet mode)
     _out(f"✅ Swap: {amount_human:.0f} {token_in_sym} → {expected_human:.6f} {token_out_sym} ({wallet_short})")
+    _out(f"👛 Wallet: {wallet_token_in:.2f} {token_in_sym} | {wallet_token_out:.6f} {token_out_sym}")
     _out(f"💰 Master: {master_bnb_eth:.4f} BNB | Sponsor: {sponsor_bnb_eth:.4f} BNB")
 
 
