@@ -7,6 +7,8 @@ Supports two execution modes:
 
 Designed for multi-wallet, cron-driven execution — one swap per run, then exits.
 
+> Experimental smart-contract project exploring transaction gas-fee sponsoring.
+
 GasSponsor Contract: https://github.com/kinged007/gas-sponsor-contract
 
 ## How It Works
@@ -401,3 +403,11 @@ If a wallet row has a Secret Phrase but no Private Key, the bot automatically de
 
 **Swap reverts with `ExecutionFailed`**
 → Check that the PancakeSwap pool has sufficient liquidity. The bot recovers tokens automatically on failure.
+
+## Development
+
+```bash
+pip install ruff mypy
+ruff check .
+python -m py_compile swap.py wallet_manager.py check_balances.py
+```
